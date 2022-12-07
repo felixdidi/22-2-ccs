@@ -1,0 +1,947 @@
+---
+title: "Whole Game"
+subtitle: "Exercise"
+author: "Felix Dietrich"
+date: "12/06/2022"
+categories:
+  - "CCS"
+  - "Exercise"
+  - "Data Science"
+bibliography: 
+  - "bibliography/r-references.bib"
+  - "bibliography/references.bib"
+csl: "bibliography/apa.csl"
+format:
+  html:
+    toc: true
+    number-sections: false
+    self-contained: true
+    smooth-scroll: true
+    citations-hover: true
+    footnotes-hover: true
+    code-fold: false
+    code-tools: true
+    code-line-numbers: true
+    highlight-style: gruvbox
+    grid:
+      sidebar-width: 250px
+      body-width: 900px
+      margin-width: 300px
+theme:
+  light: [cosmo, theme.scss]
+---
+
+```{=html}
+<style type="text/css">
+caption, .table-caption {
+  text-align: left;
+}
+</style>
+```
+
+
+# Instructions
+
+- Please finish the complete exercise (no. 1-4)
+- If you get stuck at some point, please describe the problem as detailed as possible
+- If there are multiple options (e.g., "a" or "b"), you can chose one option
+
+You can either use a local installation of R and the required packages or the Docker image for this class, which now includes all packages that we have used so far.
+
+```bash
+docker run \
+  --name=rproject \
+  -d \
+  -e USER=rstudio \
+  -e ROOT=true \
+  -e PASSWORD=ccs \
+  -p 80:8787 \
+  -v $(pwd):/home/rstudio/host \
+  --rm \
+  felixdidi/22-2-ccs
+```
+
+Also, to use RSelenium, we need to start a Selenium Container on our local machine.
+
+```bash
+docker run --name=selenium_container -d -p 4445:4444 --rm selenium/standalone-firefox:2.53.1
+```
+
+The easiest way to run both together is by using docker-comose and including the following `compose.yml`:
+
+```yml
+services:
+  rstudio: 
+    image: felixdidi/22-2-ccs
+    ports:
+      - "80:8787"
+    links:
+      - selenium:selenium
+    volumes:
+      - .:/home/rstudio/host
+    env_file:
+    - .env
+  selenium:
+    image: selenium/standalone-firefox:2.53.1
+    ports:
+      - "4445:4444"
+```
+
+# Setup
+
+```{r}
+#| echo: false
+#| message: false
+# install packages that are missing in Docker version
+install.packages("papaja")
+install.packages("rstatix")
+```
+
+
+```{r}
+#| label: setup
+#| echo: false
+#| message: false
+
+# load packages
+library(tidyverse)
+library(webdriver)
+library(rvest)
+library(RSelenium)
+library(udpipe)
+library(tidytext)
+library(quanteda)
+library(stm)
+library(furrr)
+library(text2vec)
+library(oolong)
+library(rstatix)
+library(papaja)
+
+# create bib file with r-packages
+r_refs(file = "bibliography/r-references.bib")
+
+# credit packages
+r_citations <- cite_r("bibliography/r-references.bib",
+                      footnote = FALSE,
+                      withhold = FALSE,
+                      pkgs = c("tidyverse",
+                               "webdriver",
+                               "rvest",
+                               "RSelenium",
+                               "udpipe",
+                               "tidytext",
+                               "quanteda",
+                               "oolong",
+                               "papaja"
+                               ))
+```
+
+We used `r r_citations` for our analyses and to compile this report.
+
+# 1 Get text data
+
+Gather some text data about the UN Conference on Climate Change (COP27).
+
+## (a) Tweets
+
+**Instruction:** Gather as many tweets as possible that use the hashtag `#COP27` in a timeframe around the conference date.
+
+**Solution:** If you use the Docker image, you need to install the `rtweet` package (I forgot to include it in the Docker image 🙈). Also, you need to import your authentication because this does not work interactively in RStudio Server. If you run a local installation of R and RStudio, you should be able to authenticate when running a function from the package for the first time. To import authentication, authenticate locally (as described in the package documentation) and then save your access token with `rtweet::auth_save("rtweet_auth")`. You can then import and authenticate as documented below:
+
+```{r}
+#| eval: false
+# this code chunk is not evaluated when rendering
+# instead, we load the scraped tweets below
+
+# install the package
+install.packages("rtweet", dependencies = TRUE)
+# load it
+library(rtweet)
+
+# authenticate
+auth <- readRDS("rtweet_auth.rds")
+auth_as(auth)
+
+# get tweets
+tweets <-
+  rtweet::search_tweets(
+    q = "#COP27", # query
+    # n = Inf, # download as many tweets as possible
+    # might be resticted by rate limits, which we can account for
+    retryonratelimit = TRUE, # account for rate limits
+    n = 500, # get 500 tweets for demo
+    include_rts = FALSE # exlude retweets
+    )
+
+# save tweets
+save(tweets, file = "tweets")
+```
+
+```{r}
+# tweets are loaded with this chunk from saved data
+load("tweets")
+
+tweets
+```
+
+
+## (b) News Articles
+
+**Instruction:** Get news articles which have been published in a timeframe around the conference date which refer to the Climate Conference. News articles might be accessible through APIs, Web Scraping, or data bases such as GDELT.
+
+**Solution:** For this example, we compare tagesschau and Frankfurter Allgemeine Zeitung news articles so that we can make use of the archive scrapers from the [fodira project](https://github.com/chainsawriot/fodira/tree/master/archive_scrapers). We scrape news articles from both websites for the timeframe of the conference, which was 6 November until 20 November 2022.
+
+### tagesschau
+
+First, let's get the links for all tagesschau articles. To do this, we use the scraper functions from fodira.
+
+```{r}
+#| eval: false
+# define the scraper functions
+tagesschau_getlink <- function(html){
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//span[contains(@class, 'teaser-xs__headline')]") %>% 
+    rvest::html_text(., trim = TRUE) -> item_title
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//a[contains(@class, 'teaser-xs__link')]") %>% 
+    rvest::html_attr("href")  -> item_link
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//span[contains(@class, 'teaser-xs__date')]") %>% 
+    rvest::html_text(., trim = TRUE) %>% 
+    as.Date(., tryFormat = c("%d.%m.%Y - %H:%M Uhr")) -> item_pubdate
+  
+  df <- data.frame(item_title, item_link, item_pubdate)
+  return(df)
+}
+
+tagesschau_getlink_url <- function(url){
+  pjs_session$go(url)
+  Sys.sleep(4)
+  print(url)
+  return(tagesschau_getlink(pjs_session$getSource()))
+}
+
+
+tagesschau_go_thr_archive <- function(startdate, enddate){
+  V1<-seq(as.Date(startdate), as.Date(enddate), by="days")
+  
+  V1 %>% as.character() %>%
+    paste0("https://www.tagesschau.de/archiv/?datum=", .) %>%
+    purrr::map_df(~tagesschau_getlink_url(.)) -> valid_links
+  
+  return(valid_links)
+}
+```
+
+Next, let's do the scraping:
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering because we load the scraped links below
+# install and run phantomjs
+webdriver::install_phantomjs()
+pjs_instance <- run_phantomjs()
+pjs_session <- Session$new(port = pjs_instance$port)
+
+# get article links
+tagesschau_links <- tagesschau_go_thr_archive("2022-11-06", "2022-11-20")
+
+# rename some variables
+tagesschau_links <- 
+  tagesschau_links %>%
+  dplyr::rename(title = item_title, link = item_link, pubdate = item_pubdate) %>% 
+  dplyr::mutate(pub = "Tagesschau", description = NA) %>%
+  dplyr::select(pub, link, pubdate, title, description)
+
+# save
+save(tagesschau_links, file = "tagesschau_links")
+```
+
+```{r}
+# load saved links
+load("tagesschau_links")
+
+tagesschau_links %>% as_tibble()
+```
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering because we load the scraped articles below
+
+# create empty container for data
+tagesschau_data <- tibble(url = NULL, text = NULL)
+
+# set counter to 0
+count <- 0
+
+# loop over all links and scrape article text
+for (url in tagesschau_links$link) {
+  
+  html_text <- read_html(url) %>% 
+    html_nodes(".textabsatz") %>% 
+    html_text2() %>% 
+    str_flatten()
+  
+  temp_df <- tibble(url = url, text = html_text)
+  
+  tagesschau_data <- bind_rows(tagesschau_data, temp_df)
+  
+  print(count)
+  count <- count + 1
+  print(url)
+  Sys.sleep(2)
+}
+
+# combine with links
+tagesschau_data <- left_join(tagesschau_data, tagesschau_links, by = c("url" = "link"))
+
+# save
+save(tagesschau_data, file = "tagesschau_data")
+```
+
+```{r}
+load("tagesschau_data")
+
+tagesschau_data
+```
+
+Let's extract all articles that cover the climate conference:
+
+```{r}
+tagesschau_climate <- 
+  tagesschau_data %>% 
+  filter(str_detect(text, "Klimakonferenz"))
+```
+
+### FAZ
+
+Now, let's get all links from Frankfurter Allgemeine Zeitung for the defined timeframe. To do this, we need to use Selenium to run an interactive webbrowser which can circumvent the browser cookie popup window on this site. Again, let's first define the functions according to the fodira project.
+
+```{r}
+#| eval: false
+
+# define the scraper functions
+faz_get_links <- function(html){
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//div[contains(@class, 'Teaser620')]//a//h2") %>% 
+    rvest::html_text(trim = TRUE) -> item_title
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//div[contains(@class, 'Teaser620')]/a[1]") %>% 
+    rvest::html_attr("href") %>% paste0("https://www.faz.net",.)-> item_link
+  
+  rvest::read_html(html) %>% 
+    rvest::html_elements(xpath = "//span[contains(@class, 'ThemaAuszeichnung')]") %>% 
+    rvest::html_text(trim = TRUE) %>% stringr::str_extract("[0-9]+\\.[0-9]+\\.[0-9]+") %>%
+    lubridate::dmy()-> item_pubdate
+  
+  df <- data.frame(item_title, item_link, item_pubdate)
+  return(df)
+}
+
+
+faz_get_url <- function(url){
+  remDr$navigate(url)
+  print(remDr$getCurrentUrl())
+  remDr$getPageSource()[[1]] %>% faz_get_links() -> df
+  return(df)
+}
+
+faz_go_thr_archive <- function(startdate, enddate){
+
+  seq(as.Date(startdate), as.Date(enddate), by="days") %>% 
+    format.Date(format="-%Y-%B-%d") -> V1
+  
+  V1 %>% paste0("https://www.faz.net/artikel-chronik/nachrichten", ., "/") %>%
+    purrr::map_df(~faz_get_url(.)) -> df
+  
+  
+  return(df)
+}
+```
+
+Now, let's do the scraping:
+
+```{r}
+#| eval: false
+# this code chunk is not evaluated when rendering because we load the scraped links below
+
+# on your local machine, you can Selenium inside another Docker container,
+# as described above (Instructions)
+
+# open connection to the browser on the port which we set for the
+# selinium Docker container in the compose file
+remDr <- remoteDriver(
+  remoteServerAddr = "selenium",
+  port = 4444L,
+  browserName = "firefox"
+)
+
+# open remote driver
+remDr$open(silent = TRUE)
+
+# get article links
+faz_links <- faz_go_thr_archive("2022-11-06", "2022-11-20")
+
+# rename some variables
+faz_links <- 
+  faz_links %>%
+  dplyr::rename(title = item_title, link = item_link, pubdate = item_pubdate) %>% 
+  dplyr::mutate(pub = "FAZ", description = NA) %>%
+  dplyr::select(pub, link, pubdate, title, description)
+
+# save
+save(faz_links, file = "faz_links")
+```
+
+
+```{r}
+# load saved links
+load("faz_links")
+
+faz_links %>% as_tibble()
+```
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering because we load the scraped articles below
+
+# create empty container for data
+faz_data <- tibble(url = NULL, text = NULL)
+
+# set counter to 0
+count <- 0
+
+# loop over all links and scrape article text
+for (url in faz_links$link) {
+  
+  html_text <- read_html(url) %>% 
+    html_nodes(".atc-TextParagraph") %>% 
+    html_text2() %>% 
+    str_flatten()
+  
+  temp_df <- tibble(url = url, text = html_text)
+  
+  faz_data <- bind_rows(faz_data, temp_df)
+  
+  print(count)
+  count <- count + 1
+  print(url)
+  Sys.sleep(2)
+}
+
+# combine with links
+faz_data <- left_join(faz_data, faz_links, by = c("url" = "link"))
+
+# save
+save(faz_data, file = "faz_data")
+```
+
+```{r}
+load("faz_data")
+
+faz_data
+```
+
+
+Let's extract all articles that cover the climate conference:
+
+```{r}
+faz_climate <- 
+  faz_data %>% 
+  filter(str_detect(text, "Klimakonferenz"))
+```
+
+# 2 Pre-Processing
+
+**Instruction:** For some approaches (e.g., when using embeddings), simple pre-processing might be sufficient (or even advised). Decide how much pre-processing is suitable for your task and implement this below. You may chose a tidy or DFM based approach.
+
+**Solution:** Here, I will use a tidytext approach (using the news articles scraped above). First, let's combine tagesschau and FAZ data that cover the COP27:
+
+```{r}
+docs <- bind_rows(tagesschau_climate, faz_climate)
+
+# clean
+clean_docs <-
+  docs %>% 
+    # clean punctuation
+    mutate(clean_text = str_replace_all(text, "[:punct:]", "")) %>% 
+    # clean symbols
+    mutate(clean_text = str_replace_all(clean_text, "[:symbol:]", "")) %>% 
+    # clean numbers
+    mutate(clean_text = str_replace_all(clean_text, "[:digit:]", "")) %>% 
+    #clean hashtags
+    mutate(clean_text = str_replace_all(clean_text, "#\\w+", "")) %>% 
+    # clean unnecessary white spaces
+    mutate(clean_text = str_squish(clean_text)) %>% 
+    # relocate
+    relocate(clean_text, .after = text) %>% 
+    # detect language
+    mutate(cld2_lang = cld2::detect_language(clean_text)) %>% 
+    # and filter out only german texts
+    filter(cld2_lang == "de") %>% 
+    # add doc id
+    rowid_to_column(var = "doc_id")
+```
+
+Now, let's lemmatize:
+
+```{r}
+#| eval: false
+# this code chunk is not evaluated when rendering
+# instead, we load the lemmas below to increase rendering speed
+
+# download language model
+# ud_model_de <- udpipe_download_model(language = "german")
+
+# load language model
+ud_model_de <- udpipe_load_model("german-gsd-ud-2.5-191206.udpipe")
+
+# lemmatize
+lemmas <- udpipe(clean_docs$text,
+                 object = ud_model_de,
+                 parallel.cores = 8)
+
+save(lemmas, file = "lemmas")
+```
+
+```{r}
+#| message: false
+
+load("lemmas")
+
+# combine lemmas with article information
+lemmas <- lemmas %>% mutate(doc_id = as.numeric(doc_id))
+lemmas <- left_join(x = lemmas, y = clean_docs)
+
+# summarise on document level
+d <-
+  lemmas %>%
+  group_by(doc_id) %>%
+  summarise(lemmatized_text = paste(lemma, collapse = " "),
+            across(names(clean_docs)[-1])) %>% 
+  distinct() %>% 
+  relocate(lemmatized_text, .after = clean_text) %>% 
+  ungroup()
+
+# unnest tokens and remove stopwords
+tokens <- d %>%
+  unnest_tokens(word, lemmatized_text, token = "words", to_lower = TRUE) %>%
+  anti_join(get_stopwords(language = "de", source="stopwords-iso")) %>%
+  filter(!str_detect(word, "NA")) %>% # remove "NA" resulting from lemmatization
+  add_count(word) %>%
+  filter(n > 20) # remove very infrequent terms
+
+tokens
+```
+
+
+# 3 Analyzing
+
+Follow one approach to analyzing texts that we have discussed in class.
+
+## (a) Dictionary Analysis
+
+**Instruction:** Conduct a dictionary based analysis of your texts (e.g., sentiment).
+
+**Solution:** For this example, we use the tokens from the news articles in a tidy text approach (which we created above) and implement a German sentiment dictionary.
+
+```{r}
+#| message: false
+
+# read in a German sentiment dictionary
+load("Rauh_SentDictionaryGerman.Rdata")
+
+sent_dictionary <- 
+  sent.dictionary %>%
+  as_tibble() %>% 
+  mutate(
+    # convert score to numeric variable
+    sentiment = as.numeric(sentiment),
+    # clean features (remove white space)
+    feature = str_trim(feature)
+    )
+
+# add scores
+scored <-
+  left_join(tokens, sent_dictionary, by = c("word" = "feature")) %>% # join with scores
+  mutate(value = if_else(is.na(sentiment), 0, sentiment)) %>% # missing words to 0
+  group_by(doc_id) %>%
+  summarise(sentiment = mean(value), .groups = "drop") %>%  # average score per text
+  left_join(d) # join data back in
+
+scored
+```
+
+## (b) Topic Modeling
+
+**Instruction:** Calculate a Structural Topic Model. Consider adding suitable covariates and identifying *k* through a data driven approach.
+
+**Solution:** For this example, we use the tokens from the news articles in a tidy text approach (which we created above). The stm package, however, requires input as a quanteda corpus or sparse matrix. So, let's first convert our tidy tokens into a sparse matrix.
+
+```{r}
+# sparse matrix
+sparse_docs <- tokens %>%
+  count(doc_id, word) %>%
+  cast_sparse(doc_id, word, n)
+
+sparse_docs[1:10, ]
+```
+
+Next, let's determine a suitable number of topics *k*. To do this, we calculate a sequence of topic models with different numbers of *k*. Depending on the number of documents, you may want to vary minimum, maximum and distance between steps when doing this. For this example (to optimize computation time), we calculate only 10 different models from 5 to 50 in steps of 5.
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering to speed up rendering
+# instead, we save and load the object below
+
+# determine sequence of models to calculate
+min <- 5
+max <- 50
+steps <- 5
+k_range <- seq(min, max, steps)
+
+# plan multisession for better speed
+plan(multisession, workers = 8)
+
+# set seed
+set.seed(42)
+
+# calculate models along the defined sequence
+# here, we add publication date and news outlet (so: tagesschau vs. FAZ)
+# as possible covariates for topic prevalence
+many_models <- tibble(K = k_range) %>%
+  mutate(topic_model = future_map(K, 
+                                  ~ stm(sparse_docs,
+                                        prevalence =~ pubdate + pub,
+                                        data = d,
+                                        gamma.prior = "L1",
+                                        K = .,
+                                        verbose = FALSE),
+         .options = furrr_options(seed = 42),
+         .progress = TRUE))
+
+save(many_models, file = "many_models")
+```
+
+```{r}
+load("many_models")
+
+# calculate diagnostics
+heldout <- make.heldout(sparse_docs, seed = 42)
+
+k_result <- many_models %>%
+  mutate(exclusivity = map(topic_model, exclusivity),
+         semantic_coherence = map(topic_model, semanticCoherence, sparse_docs),
+         eval_heldout = map(topic_model, eval.heldout, heldout$missing),
+         residual = map(topic_model, checkResiduals, sparse_docs),
+         bound =  map_dbl(topic_model, function(x) max(x$convergence$bound)),
+         lfact = map_dbl(topic_model, function(x) lfactorial(x$settings$dim$K)),
+         lbound = bound + lfact,
+         iterations = map_dbl(topic_model, function(x) length(x$convergence$bound)))
+
+# plot diagnostics
+k_result %>%
+  transmute(K,
+            `Lower bound` = lbound,
+            Residuals = map_dbl(residual, "dispersion"),
+            `Semantic coherence` = map_dbl(semantic_coherence, mean),
+            `Held-out likelihood` = map_dbl(eval_heldout, "expected.heldout")) %>%
+  gather(Metric, Value, -K) %>%
+  ggplot(aes(K, Value)) +
+  geom_line(size = 1.5, alpha = 0.7, show.legend = FALSE) +
+  facet_wrap(~Metric, scales = "free_y") +
+  labs(x = "K (number of topics)",
+       y = NULL) +
+  theme_bw()
+
+range <- seq(5, 50, 5)
+
+group_means <- k_result %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  filter(K %in% range) %>%
+  unnest(cols = c(exclusivity, semantic_coherence)) %>%
+  mutate(K = as.factor(K)) %>%
+  group_by(K) %>%
+  summarise(
+    exclusivity = mean(exclusivity),
+    semantic_coherence = mean(semantic_coherence)
+  )
+
+# plot semantic coherence and exclusivity
+k_result %>%
+  select(K, exclusivity, semantic_coherence) %>%
+  filter(K %in% range) %>%
+  unnest(cols = c(exclusivity, semantic_coherence)) %>%
+  mutate(K = as.factor(K)) %>%
+  ggplot(aes(semantic_coherence, exclusivity, z = K, color = K)) +
+  geom_point(size = 2, alpha = 0.7) +
+  geom_label(data = group_means, label = group_means$K, size = 4, show.legend = FALSE) +
+  labs(x = "Semantic coherence",
+       y = "Exclusivity") +
+  theme_bw() +
+  theme(legend.position = "none") +
+  scale_color_grey(start = .5, end = 0)
+```
+
+The diagnostics are somewhat difficult to interpret in this example because we only have a very low number of documents. But it seems like the model with *k* = 30 seems to be a good bet.
+
+```{r}
+# extract K = 30 model
+topic_model <- k_result %>% 
+  filter(K == 30) %>% 
+  pull(topic_model) %>% 
+  .[[1]]
+
+topic_model
+```
+
+Here, we have our topic model. Please check out the materials from class to see how to extract beta and gamma probablities from this model and how to conduct further analyses, such as extracting top words, topics, and plotting.
+
+## (c) Embeddings
+
+**Instruction:** Convert your text data into word embeddings (e.g., by using the `text2vec` package or a Huggingface pipeline).
+
+**Solution:** Let's create our own word embeddings from the text data using the glove algorithm (here, we use the unprocessed news articles):
+
+```{r}
+tokens <- space_tokenizer(str_to_lower(d$text))
+
+# create vocabulary. Terms will be unigrams (simple words).
+it <- itoken(tokens)
+vocab <- create_vocabulary(it)
+
+vectorizer <- vocab_vectorizer(vocab)
+
+# use window of 4 for context words (term-co-occurrence matrix)
+tcm <- create_tcm(it, vectorizer, skip_grams_window = 4L)
+
+# use 100 dimensions
+glove <- GlobalVectors$new(rank = 100, x_max = 10)
+
+# compute
+wv_main <- glove$fit_transform(tcm,
+                               n_iter = 10,
+                               convergence_tol = 0.01,
+                               n_threads = 8
+                             )
+
+# get results
+wv_context <- glove$components
+word_vectors <- wv_main + t(wv_context)
+
+word_vectors[1:10, 1:5]
+```
+
+Here is a sample of the first 10 words and first 5 dimensions from our embedding space. See the course materials to see how to use this space for further calculations.
+
+We can also use pretrained transformers for our analyses. These can be used to create word embeddings, but also to do classification (e.g., sentiment analysis). In the example below, we will classify emotions within a text.
+
+Tip: you can also run Python code directly within your .Rmd document through the `reticulate` package. This should be all set up in the Docker image. If you are running this locally, either run it directly in python or install all required Python libraries using `reticulate::virtualenv::install()` (check out `reticulate` documentation for details, I set it up for Docker already).
+
+```{r}
+#| eval: false
+library(reticulate)
+
+Sys.setenv("RETICULATE_PYTHON" = "/home/rstudio/.virtualenvs/dev-environment/bin/python")
+Sys.setenv("RETICULATE_PYTHON_ENV" = "/home/rstudio/.virtualenvs/dev-environment")
+
+reticulate::py_config()
+
+# it seems like there is a problem with version of transformers installed in the
+# Docker image: https://github.com/huggingface/transformers/issues/20457
+# so we install the latest Github Version of transformers and version 2.10 of tensorflow manually
+reticulate::virtualenv_remove(".virtualenvs/dev-environment", "tensorflow")
+reticulate::virtualenv_remove(".virtualenvs/dev-environment", "transformers")
+reticulate::virtualenv_install(".virtualenvs/dev-environment", "tensorflow==2.10")
+reticulate::virtualenv_install(".virtualenvs/dev-environment", "git+https://github.com/huggingface/transformers")
+```
+
+Unfortunately, this still does not fix the error `No module named 'keras.saving.hdf5_format'`. Hopefully, a future version of the transformers library will fix this.
+
+In theory, however, you would be able to define a function within Python as below and then access it from within `R` using the `py` object.
+
+```{python}
+#| eval: false
+# here, we define a Python function named classify which we can call from within R below
+from transformers import RobertaTokenizerFast, TFRobertaForSequenceClassification, pipeline
+
+# define a function
+def classify(texts):
+  tokenizer = RobertaTokenizerFast.from_pretrained("arpanghoshal/EmoRoBERTa")
+  model = TFRobertaForSequenceClassification.from_pretrained("arpanghoshal/EmoRoBERTa")
+  emotion = pipeline('sentiment-analysis', model='arpanghoshal/EmoRoBERTa')
+  emotion_labels = emotion(texts)
+  return(emotion_labels)
+```
+
+Now, we can use the classify function defined above within `R` on some character vetor in our `R` environment.
+
+```{r}
+#| eval: false
+classification <- py$classify(some_text_vector)
+```
+
+
+# 4 Validating
+
+**Instruction:** Validate your approach according to the methods discussed in class (e.g., by using the `oolong` package).
+
+**Solution:**
+
+## (a) Dictionary
+
+Here, we use the sentiment scores which we calculated from the news articles above. Of course, for our validation, we should use a different sample of text than the one which we use for our analysis. However, for simplicity, we will use the sama data here.
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering to speed up rendering
+# instead, we save and load the object below
+
+# set seed
+set.seed(42)
+# Setting up oolong object
+gs_test <- create_oolong(input_corpus = d$text,
+                         construct = "positive",
+                         exact_n = 10)
+gs_test
+
+# Conducting gold standrad coding & locking it
+gs_test$do_gold_standard_test()
+gs_test$lock()
+
+# save
+save(gs_test, file = "gs_test")
+
+```
+
+![Dictionary Validation Gold Standard Coding](img/dic_valid.png)
+
+```{r}
+#| message: false
+#| fig-cap: Validation Results
+
+load("gs_test")
+
+# transforming the test data in a quanteda corpus object
+gs_corpus <- gs_test$turn_gold()
+gs_corpus
+
+# create character vector of coded texts
+gs_texts <- 
+  gs_corpus %>% 
+  convert(to = "data.frame") %>% 
+  pull(text)
+
+# get matching texts from tidy data
+gs_data <- 
+  d %>% 
+  filter(text %in% gs_texts)
+
+# do dictionary analysis like above
+gs_scored <-
+  gs_data %>% 
+  unnest_tokens(word, lemmatized_text, token = "words", to_lower = TRUE) %>%
+  anti_join(get_stopwords(language = "de", source="stopwords-iso")) %>%
+  filter(!str_detect(word, "NA")) %>% # remove "NA" resulting from lemmatization
+  left_join(., sent_dictionary, by = c("word" = "feature")) %>% # join with scores
+  mutate(value = if_else(is.na(sentiment), 0, sentiment)) %>% # missing words to 0
+  group_by(doc_id) %>%
+  summarise(sentiment = mean(value), .groups = "drop") %>%  # average score per text
+  left_join(d) # join data back in
+
+# compare with manual coding
+results_gs_test <- summarize_oolong(gs_test, target_value = gs_scored$sentiment)
+
+plot(results_gs_test)
+```
+
+**Interpretation:**
+
+According to @R-oolong, the plots can be interpreted as follows:
+
+1. Correlation between human judgement and target value - A strong correlation between the two is an indicator of criterion validity of the target value.
+2. Bland-Altman plot - If the dots are randomly scattering around the mean value (solid line), it is an indicator of good agreement between human judgement and the target value.
+3. Correlation between target value and content length - If there is no strong correlation between the target value and content length, it is an indicator of robustness against the influence of content length (see Chan et al., 2020).
+4. Cook’s distance of all data points - if there are only a few dots above the threshold (dotted line), it is an indicator of robustness against the influence of outliers.
+
+## (b) Topic Model
+
+To validate our topic model from above, we use the *k* = 30 topic model and the text data from `d`.
+
+```{r}
+#| eval: false
+
+# this code chunk is not evaluated when rendering to speed up rendering
+# instead, we save and load the object below
+
+set.seed(42)
+# create the oolong object
+oolong_topic_model <- create_oolong(input_model = topic_model, input_corpus = d$text, exact_n = 10)
+
+oolong_topic_model
+
+# do word intrusion test
+oolong_topic_model$do_word_intrusion_test()
+
+# do topic intrusion test
+oolong_topic_model$do_topic_intrusion_test()
+
+# lock the object
+oolong_topic_model$lock()
+
+# save
+save(oolong_topic_model, file = "oolong_topic_model")
+```
+
+![Topic Model Validation Word Intrusion](img/word_valid.png)
+
+![Topic Model Validation Topic Intrusion](img/topic_valid.png)
+
+```{r}
+load("oolong_topic_model")
+
+oolong_topic_model
+```
+
+The validation revealed that we likely estimated way too many topics, because it was almost impossible to differentiate them in the topic intrusion test. This is also represented in the poor precision (I guessed for most topics).
+
+# 5 (Optional) Modeling
+
+**Instruction:** Propose one preliminary hypothesis and test it using some statistical model.
+
+**Solution:** Let's test the hypothesis that Tagesschau will report more positive about the climate conference than FAZ. This is not really based on any theoretical consideration, but should do for a simple demonstration...
+
+H1: The positivity score of news articles vovering COP27 will be more positive for articles from tagesschau than from FAZ.
+
+Because we only compare two sources, a simple t-test will do.
+
+```{r}
+# get summary stats
+scored %>% 
+  # create outlet factor variable
+  mutate(outlet = as.factor(pub)) %>% 
+  # group
+  group_by(outlet) %>% 
+  # get summary stats
+  get_summary_stats(sentiment)
+
+scored %>% 
+  # create outlet factor variable
+  mutate(outlet = as.factor(pub)) %>% 
+  # conduct the test
+  t_test(sentiment ~ outlet)
+```
+
+We can see that there is no significant positivity difference (*p* = .848) between news articles that were published in tageschau (*M* = 0.078, *SD* = 0.064) and FAZ (*M* = 0.075, *SD* = 0.084).
+

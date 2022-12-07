@@ -1,0 +1,15 @@
+services:
+  rstudio: 
+    image: felixdidi/22-2-ccs
+    ports:
+      - "80:8787"
+    links:
+      - selenium:selenium
+    volumes:
+      - .:/home/rstudio/host
+    env_file:
+    - .env
+  selenium:
+    image: selenium/standalone-firefox:2.53.1
+    ports:
+      - "4445:4444"
